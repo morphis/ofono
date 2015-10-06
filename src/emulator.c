@@ -27,6 +27,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdbool.h>
+#include <errno.h>
 
 #include <glib.h>
 
@@ -50,6 +51,10 @@ struct ofono_emulator {
 	guint callsetup_source;
 	int pns_id;
 	struct ofono_handsfree_card *card;
+	int r_codecs;
+	uint8_t negotiated_codec;
+	uint8_t proposed_codec;
+	guint delay_sco;
 	bool slc : 1;
 	unsigned int events_mode : 2;
 	bool events_ind : 1;
@@ -938,6 +943,140 @@ fail:
 	}
 }
 
+static void bac_cb(GAtServer *server, GAtServerRequestType type,
+			GAtResult *result, gpointer user_data)
+{
+	struct ofono_emulator *em = user_data;
+	GAtResultIter iter;
+	int val;
+
+	DBG("");
+
+	switch (type) {
+	case G_AT_SERVER_REQUEST_TYPE_SET:
+		if (!ofono_emulator_codec_negotiation_supported(em)) {
+			DBG("Codec negotiation is not supported from our side");
+			goto fail;
+		}
+
+		em->r_codecs = 0;
+		em->negotiated_codec = 0;
+
+		g_at_result_iter_init(&iter, result);
+		g_at_result_iter_next(&iter, "");
+
+		/* CVSD codec is mandatory and must come first.
+		 * See HFP v1.6 4.34.1 */
+		if (g_at_result_iter_next_number(&iter, &val) == FALSE ||
+			val != HFP_CODEC_CVSD)
+			goto fail;
+
+		em->r_codecs |= HFP_CODEC_CVSD;
+
+		while (g_at_result_iter_next_number(&iter, &val))
+			em->r_codecs |= val;
+
+		g_at_server_send_final(server, G_AT_SERVER_RESULT_OK);
+
+		/* If we're currently in the process of selecting a codec
+		 * we have to restart that now */
+		if (em->proposed_codec)
+			ofono_emulator_start_codec_negotiation(em, 0);
+
+		break;
+
+	default:
+fail:
+		DBG("Process AT+BAC failed");
+		g_at_server_send_final(server, G_AT_SERVER_RESULT_ERROR);
+		break;
+	}
+}
+
+static gboolean connect_sco_delayed(gpointer user_data)
+{
+	struct ofono_emulator *em = user_data;
+	int err;
+
+	DBG("");
+
+	em->delay_sco = 0;
+
+	err = ofono_handsfree_card_connect_sco(em->card);
+	if (err == 0)
+		return FALSE;
+
+	/* If we have another codec we can try then lets do that */
+	if (em->negotiated_codec != HFP_CODEC_CVSD)
+		ofono_emulator_start_codec_negotiation(em, HFP_CODEC_CVSD);
+
+	return FALSE;
+}
+
+static void bcs_cb(GAtServer *server, GAtServerRequestType type,
+			GAtResult *result, gpointer user_data)
+{
+	struct ofono_emulator *em = user_data;
+	GAtResultIter iter;
+	int val;
+
+	switch (type) {
+	case G_AT_SERVER_REQUEST_TYPE_SET:
+		g_at_result_iter_init(&iter, result);
+		g_at_result_iter_next(&iter, "");
+
+		if (!g_at_result_iter_next_number(&iter, &val))
+			break;
+
+		if (em->proposed_codec != val) {
+			em->proposed_codec = 0;
+			break;
+		}
+
+		em->proposed_codec = 0;
+		em->negotiated_codec = val;
+
+		g_at_server_send_final(server, G_AT_SERVER_RESULT_OK);
+
+		if (!em->delay_sco)
+			em->delay_sco = g_idle_add(connect_sco_delayed, em);
+
+		return;
+	default:
+		break;
+	}
+
+	g_at_server_send_final(server, G_AT_SERVER_RESULT_ERROR);
+}
+
+static void bcc_cb(GAtServer *server, GAtServerRequestType type,
+			GAtResult *result, gpointer user_data)
+{
+	struct ofono_emulator *em = user_data;
+
+	switch (type) {
+	case G_AT_SERVER_REQUEST_TYPE_COMMAND_ONLY:
+		if (!ofono_emulator_codec_negotiation_supported(em))
+			break;
+
+		g_at_server_send_final(server, G_AT_SERVER_RESULT_OK);
+
+		if (!em->negotiated_codec) {
+			ofono_emulator_start_codec_negotiation(em, 0);
+			return;
+		}
+
+		if (!em->delay_sco)
+			em->delay_sco = g_idle_add(connect_sco_delayed, em);
+
+		return;
+	default:
+		break;
+	}
+
+	g_at_server_send_final(server, G_AT_SERVER_RESULT_ERROR);
+}
+
 static void emulator_add_indicator(struct ofono_emulator *em, const char* name,
 					int min, int max, int dflt,
 					gboolean mandatory)
@@ -1047,6 +1186,9 @@ void ofono_emulator_register(struct ofono_emulator *em, int fd)
 		g_at_server_register(em->server, "+BIA", bia_cb, em, NULL);
 		g_at_server_register(em->server, "+BIND", bind_cb, em, NULL);
 		g_at_server_register(em->server, "+BIEV", biev_cb, em, NULL);
+		g_at_server_register(em->server, "+BAC", bac_cb, em, NULL);
+		g_at_server_register(em->server, "+BCC", bcc_cb, em, NULL);
+		g_at_server_register(em->server, "+BCS", bcs_cb, em, NULL);
 	}
 
 	__ofono_atom_register(em->atom, emulator_unregister);
@@ -1475,4 +1617,70 @@ void ofono_emulator_set_handsfree_card(struct ofono_emulator *em,
 		return;
 
 	em->card = card;
+}
+
+void ofono_emulator_enable_codec_negotiation(struct ofono_emulator *em)
+{
+	em->l_features |= HFP_AG_FEATURE_CODEC_NEGOTIATION;
+}
+
+ofono_bool_t ofono_emulator_codec_negotiation_supported(struct ofono_emulator *em)
+{
+	if (em->card == NULL)
+		return FALSE;
+
+	return (em->l_features & HFP_AG_FEATURE_CODEC_NEGOTIATION) &&
+		(em->r_features & HFP_HF_FEATURE_CODEC_NEGOTIATION);
+}
+
+static uint8_t select_codec(struct ofono_emulator *em)
+{
+	if (em == NULL || em->card == NULL)
+		return 0;
+
+	if (ofono_handsfree_audio_has_wideband() &&
+		em->r_codecs & HFP_CODEC_MSBC)
+		return HFP_CODEC_MSBC;
+
+	if (!(em->r_codecs & HFP_CODEC_CVSD))
+		return 0;
+
+	/* CVSD is mandatory for both sides */
+	return HFP_CODEC_CVSD;
+}
+
+ofono_bool_t ofono_emulator_codec_already_negotiated(struct ofono_emulator *em)
+{
+	if (em == NULL)
+		return FALSE;
+
+	return em->negotiated_codec;
+}
+
+int ofono_emulator_start_codec_negotiation(struct ofono_emulator *em, uint8_t codec)
+{
+	char buf[64];
+	uint8_t selected_codec;
+
+	if (em == NULL || em->card == NULL)
+		return -EINVAL;
+
+	if (codec > 0) {
+		selected_codec = codec;
+		goto done;
+	}
+
+	selected_codec = select_codec(em);
+	if (!selected_codec) {
+		DBG("Failed to selected HFP codec");
+		return -EINVAL;
+	}
+
+done:
+	em->proposed_codec = selected_codec;
+
+	snprintf(buf, 64, "+BCS: %d", selected_codec);
+	g_at_server_send_unsolicited(em->server, buf);
+
+	return 0;
 }

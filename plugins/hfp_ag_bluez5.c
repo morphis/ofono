@@ -59,22 +59,60 @@ static GHashTable *connection_hash;
 static int hfp16_card_probe(struct ofono_handsfree_card *card,
 					unsigned int vendor, void *data)
 {
+	DBG("");
+
 	return 0;
 }
 
 static void hfp16_card_remove(struct ofono_handsfree_card *card)
 {
+	DBG("");
 }
 
 static void hfp16_card_connect(struct ofono_handsfree_card *card,
 					ofono_handsfree_card_connect_cb_t cb,
 					void *data)
 {
+	int err;
+	struct ofono_emulator *em = ofono_handsfree_card_get_data(card);
+
+	DBG("");
+
+	if (ofono_emulator_codec_negotiation_supported(em) &&
+		!ofono_emulator_codec_already_negotiated(em)) {
+
+		struct ofono_error error;
+		error.type = OFONO_ERROR_TYPE_NO_ERROR;
+		error.error = 0;
+
+		err = ofono_emulator_start_codec_negotiation(em, 0);
+		if (err < 0) {
+			error.type = OFONO_ERROR_TYPE_FAILURE;
+			error.error = err;
+			cb(&error, data);
+			return;
+		}
+
+		/* We hand over to the emulator core here to establish the
+		 * SCO connection once the codec is negotiated */
+		cb(&error, data);
+
+		return;
+	}
+
+	/*
+	 * If any side (remote or local) doesn't support codec negotiation or
+	 * if the codec was already negotiated before we can directly proceed
+	 * with establishing the SCO connection. Calling connect_sco()
+	 * hands the connection responsibility to the core, so no need
+	 * to call the callback
+	 */
 	ofono_handsfree_card_connect_sco(card);
 }
 
 static void hfp16_sco_connected_hint(struct ofono_handsfree_card *card)
 {
+	DBG("");
 }
 
 static struct ofono_handsfree_card_driver hfp16_ag_driver = {
@@ -249,12 +287,18 @@ static DBusMessage *profile_new_connection(DBusConnection *conn,
 
 	driver = NULL;
 
-	if (version >= HFP_VERSION_1_6)
+	if (version >= HFP_VERSION_1_6) {
 		driver = HFP16_AG_DRIVER;
+		/* Codec negotiation between HF and AG is only supported
+		 * starting with HFP 1.6  */
+		ofono_emulator_enable_codec_negotiation(em);
+	}
 
 	card = ofono_handsfree_card_create(0,
 					OFONO_HANDSFREE_CARD_TYPE_GATEWAY,
-					driver, NULL);
+					driver, em);
+
+	ofono_handsfree_card_set_data(card, em);
 
 	ofono_handsfree_card_set_local(card, local);
 	ofono_handsfree_card_set_remote(card, remote);

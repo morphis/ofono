@@ -26,6 +26,7 @@
 extern "C" {
 #endif
 
+#include <stdint.h>
 #include <ofono/types.h>
 
 #define OFONO_EMULATOR_IND_BATTERY "battchg"
@@ -111,6 +112,11 @@ void ofono_emulator_set_hf_indicator_active(struct ofono_emulator *em,
 
 void ofono_emulator_set_handsfree_card(struct ofono_emulator *em,
 					struct ofono_handsfree_card *card);
+
+void ofono_emulator_enable_codec_negotiation(struct ofono_emulator *em);
+ofono_bool_t ofono_emulator_codec_already_negotiated(struct ofono_emulator *em);
+ofono_bool_t ofono_emulator_codec_negotiation_supported(struct ofono_emulator *em);
+int ofono_emulator_start_codec_negotiation(struct ofono_emulator *em, uint8_t codec);
 
 #ifdef __cplusplus
 }
