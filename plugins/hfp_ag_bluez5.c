@@ -49,10 +49,41 @@
 #define HFP_AG_EXT_PROFILE_PATH   "/bluetooth/profile/hfp_ag"
 #define BT_ADDR_SIZE 18
 
+#define HFP16_AG_DRIVER		"hfp16-ag-driver"
+
 static guint modemwatch_id;
 static GList *modems;
 static GHashTable *sim_hash = NULL;
 static GHashTable *connection_hash;
+
+static int hfp16_card_probe(struct ofono_handsfree_card *card,
+					unsigned int vendor, void *data)
+{
+	return 0;
+}
+
+static void hfp16_card_remove(struct ofono_handsfree_card *card)
+{
+}
+
+static void hfp16_card_connect(struct ofono_handsfree_card *card,
+					ofono_handsfree_card_connect_cb_t cb,
+					void *data)
+{
+	ofono_handsfree_card_connect_sco(card);
+}
+
+static void hfp16_sco_connected_hint(struct ofono_handsfree_card *card)
+{
+}
+
+static struct ofono_handsfree_card_driver hfp16_ag_driver = {
+	.name			= HFP16_AG_DRIVER,
+	.probe			= hfp16_card_probe,
+	.remove			= hfp16_card_remove,
+	.connect		= hfp16_card_connect,
+	.sco_connected_hint	= hfp16_sco_connected_hint,
+};
 
 static void connection_destroy(gpointer data)
 {
@@ -74,11 +105,51 @@ static gboolean io_hup_cb(GIOChannel *io, GIOCondition cond, gpointer data)
 	return FALSE;
 }
 
+static int get_version(DBusMessageIter *iter, uint16_t *version)
+{
+	DBusMessageIter dict, entry, valiter;
+	const char *key;
+	uint16_t value;
+
+	/* Points to dict */
+	dbus_message_iter_recurse(iter, &dict);
+
+	/* For each entry in this dict */
+	while (dbus_message_iter_get_arg_type(&dict) != DBUS_TYPE_INVALID) {
+		/* I want to access the entry's contents */
+		dbus_message_iter_recurse(&dict, &entry);
+
+		if (dbus_message_iter_get_arg_type(&entry) != DBUS_TYPE_STRING)
+			return -EINVAL;
+
+		/* If the current key isn't "Version", keep looking */
+		dbus_message_iter_get_basic(&entry, &key);
+		if (!g_str_equal("Version", key)) {
+			dbus_message_iter_next(&dict);
+			continue;
+		}
+
+		dbus_message_iter_next(&entry);
+		if (dbus_message_iter_get_arg_type(&entry) != DBUS_TYPE_VARIANT)
+			return -EINVAL;
+
+		dbus_message_iter_recurse(&entry, &valiter);
+		dbus_message_iter_get_basic(&valiter, &value);
+
+		if (version)
+			*version = value;
+
+		return 0;
+	}
+
+	return -ENOENT;
+}
+
 static DBusMessage *profile_new_connection(DBusConnection *conn,
 						DBusMessage *msg, void *data)
 {
 	DBusMessageIter entry;
-	const char *device;
+	const char *device, *driver;
 	GIOChannel *io;
 	int fd, fd_dup;
 	struct sockaddr_rc saddr;
@@ -87,6 +158,7 @@ static DBusMessage *profile_new_connection(DBusConnection *conn,
 	struct ofono_modem *modem;
 	char local[BT_ADDR_SIZE], remote[BT_ADDR_SIZE];
 	struct ofono_handsfree_card *card;
+	uint16_t version = HFP_VERSION_1_5;
 	int err;
 
 	DBG("Profile handler NewConnection");
@@ -104,12 +176,22 @@ static DBusMessage *profile_new_connection(DBusConnection *conn,
 		goto invalid;
 
 	dbus_message_iter_get_basic(&entry, &fd);
-	dbus_message_iter_next(&entry);
 
 	if (fd < 0)
 		goto invalid;
 
-	DBG("%s", device);
+	dbus_message_iter_next(&entry);
+	if (dbus_message_iter_get_arg_type(&entry) != DBUS_TYPE_ARRAY) {
+		close(fd);
+		goto invalid;
+	}
+
+	if (get_version(&entry, &version) < 0) {
+		close(fd);
+		goto invalid;
+	}
+
+	DBG("version: %hd", version);
 
 	/* Pick the first voicecall capable modem */
 	if (modems == NULL) {
@@ -165,9 +247,14 @@ static DBusMessage *profile_new_connection(DBusConnection *conn,
 						g_strdup(device), g_free);
 	g_io_channel_unref(io);
 
+	driver = NULL;
+
+	if (version >= HFP_VERSION_1_6)
+		driver = HFP16_AG_DRIVER;
+
 	card = ofono_handsfree_card_create(0,
 					OFONO_HANDSFREE_CARD_TYPE_GATEWAY,
-					NULL, NULL);
+					driver, NULL);
 
 	ofono_handsfree_card_set_local(card, local);
 	ofono_handsfree_card_set_remote(card, remote);
@@ -369,6 +456,7 @@ static void call_modemwatch(struct ofono_modem *modem, void *user)
 static int hfp_ag_init(void)
 {
 	DBusConnection *conn = ofono_dbus_get_connection();
+	int err;
 
 	if (DBUS_TYPE_UNIX_FD < 0)
 		return -EBADF;
@@ -381,6 +469,13 @@ static int hfp_ag_init(void)
 		ofono_error("Register Profile interface failed: %s",
 						HFP_AG_EXT_PROFILE_PATH);
 		return -EIO;
+	}
+
+	err = ofono_handsfree_card_driver_register(&hfp16_ag_driver);
+	if (err < 0) {
+		g_dbus_unregister_interface(conn, HFP_AG_EXT_PROFILE_PATH,
+						BLUEZ_PROFILE_INTERFACE);
+		return err;
 	}
 
 	sim_hash = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -403,6 +498,8 @@ static void hfp_ag_exit(void)
 	__ofono_modemwatch_remove(modemwatch_id);
 	g_dbus_unregister_interface(conn, HFP_AG_EXT_PROFILE_PATH,
 						BLUEZ_PROFILE_INTERFACE);
+
+	ofono_handsfree_card_driver_unregister(&hfp16_ag_driver);
 
 	g_hash_table_destroy(connection_hash);
 
